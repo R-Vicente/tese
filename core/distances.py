@@ -128,12 +128,19 @@ def mixed_distance_pds(sample, reference_matrix,
 
 @jit(nopython=True, parallel=True, cache=True)
 def weighted_euclidean_batch(sample, reference_matrix, weights):
+    """
+    Distância euclidiana ponderada standard: sqrt(sum(w_j * d_j^2))
+    Consistente com weighted_euclidean_pds (sem scale factor).
+    """
     n_ref = reference_matrix.shape[0]
+    n_features = len(sample)
     distances = np.empty(n_ref)
     for i in prange(n_ref):
-        diff = np.abs(reference_matrix[i] - sample)
-        weighted_diff = diff * weights
-        distances[i] = np.sqrt(np.sum(weighted_diff ** 2))
+        dist_sq = 0.0
+        for j in range(n_features):
+            diff = sample[j] - reference_matrix[i, j]
+            dist_sq += weights[j] * diff * diff
+        distances[i] = np.sqrt(dist_sq)
     return distances
 
 @jit(nopython=True, parallel=True, cache=True)
@@ -175,6 +182,7 @@ def range_normalized_mixed_distance(sample, reference_matrix,
 def weighted_euclidean_multi_query(queries, reference_matrix, weights):
     """
     Calcula distâncias euclidianas ponderadas para múltiplas queries em batch.
+    Usa fórmula standard: sqrt(sum(w_j * d_j^2))
 
     Args:
         queries: Matriz (n_queries x n_features) de queries
@@ -186,13 +194,16 @@ def weighted_euclidean_multi_query(queries, reference_matrix, weights):
     """
     n_queries = queries.shape[0]
     n_ref = reference_matrix.shape[0]
+    n_features = queries.shape[1]
     distances = np.empty((n_queries, n_ref))
 
     for q in prange(n_queries):
         for i in range(n_ref):
-            diff = np.abs(reference_matrix[i] - queries[q])
-            weighted_diff = diff * weights
-            distances[q, i] = np.sqrt(np.sum(weighted_diff ** 2))
+            dist_sq = 0.0
+            for j in range(n_features):
+                diff = queries[q, j] - reference_matrix[i, j]
+                dist_sq += weights[j] * diff * diff
+            distances[q, i] = np.sqrt(dist_sq)
 
     return distances
 

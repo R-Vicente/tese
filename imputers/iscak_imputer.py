@@ -29,7 +29,8 @@ class ISCAkCore:
                  adaptive_k_alpha: float = 0.5, fast_mode: bool = False,
                  use_fcm: bool = False, n_clusters: int = 8,
                  n_top_clusters: int = 3, fcm_membership_threshold: float = 0.05,
-                 use_pds: bool = True, min_overlap: int = None):
+                 use_pds: bool = True, min_overlap: int = None,
+                 min_pds_overlap: float = 0.5, scaling_method: str = "standard"):
         """
         Args:
             min_friends: Número mínimo de vizinhos (k_min)
@@ -47,6 +48,12 @@ class ISCAkCore:
             fcm_membership_threshold: Threshold mínimo de membership
             use_pds: Se True, usa Partial Distance Strategy (permite donors com overlap parcial)
             min_overlap: Mínimo de features em comum (default: max(3, n_features//3))
+            min_pds_overlap: Proporção mínima de overlap para activar PDS (0.0 a 1.0, default 0.5)
+            scaling_method: Método de scaling para numéricas:
+                - "standard": z-score (default)
+                - "minmax": [0, 1]
+                - "robust": mediana e IQR
+                - "none": sem scaling (dados já normalizados)
         """
         self.min_friends = min_friends
         self.max_friends = max_friends
@@ -63,6 +70,8 @@ class ISCAkCore:
         self.use_pds = use_pds
         self._min_overlap_user = min_overlap  # Guardado para calcular depois
         self.min_overlap = min_overlap  # Será ajustado no impute()
+        self.min_pds_overlap = min_pds_overlap
+        self.scaling_method = scaling_method
         self.scaler = None
         self.mi_matrix = None
         self.fcm_index = None  # FuzzyClusterIndex
@@ -165,10 +174,9 @@ class ISCAkCore:
     def _select_and_run_strategy(self, data_encoded, missing_mask,
                                   initial_missing, pct_complete_rows, start_time):
         """
-        Nova estratégia unificada:
+        Estratégia unificada:
         1. Sempre tentar ISCA-k+PDS primeiro (funciona mesmo com poucas linhas completas)
-        2. Se restarem missings: aplicar IMR/Bootstrap como fallback
-        3. Refinar com ISCA-k
+        2. Se restarem missings: modo iterativo com fallback para mediana/moda
         """
         from strategies.iscak_strategy import ISCAkStrategy
 
@@ -185,63 +193,6 @@ class ISCAkCore:
         # Executar estratégia ISCA-k (com modo iterativo para residuais)
         strategy = ISCAkStrategy()
         result = strategy.run(self, data_encoded, missing_mask, initial_missing, start_time)
-
-        return result
-
-    def _apply_imr_fallback(self, result, original_data, start_time, initial_missing, phase1_stats=None):
-        """Aplica IMR como fallback e refina com ISCA-k."""
-        import time
-        from imputers.imr_imputer import IMRInitializer
-
-        phases = [phase1_stats] if phase1_stats else []
-        before_imr = result.isna().sum().sum()
-
-        if self.verbose:
-            print(f"\n{'='*70}")
-            print("FASE 2: Fallback IMR")
-            print(f"{'='*70}")
-            print(f"  Método: IMR + Refinamento ISCA-k")
-
-        imr = IMRInitializer(n_iterations=5)
-        non_numeric = (self.mixed_handler.binary_cols +
-                      self.mixed_handler.nominal_cols +
-                      self.mixed_handler.ordinal_cols)
-        result = imr.fit_transform(result, self.mixed_handler.numeric_cols, non_numeric)
-
-        after_imr = result.isna().sum().sum()
-        n_refined = 0
-
-        if after_imr == 0:
-            # Refinar com ISCA-k
-            scaled_result = self._get_scaled_data(result, force_refit=True)
-            columns_ordered = self._rank_columns(original_data)
-            residual_mask = original_data.isna() & ~result.isna()
-
-            for col in columns_ordered:
-                if residual_mask[col].any():
-                    refined = self._refine_column_mixed(original_data, col, scaled_result, residual_mask[col])
-                    result.loc[residual_mask[col], col] = refined[residual_mask[col]]
-                    n_refined += residual_mask[col].sum()
-
-        final_missing = result.isna().sum().sum()
-
-        if self.verbose:
-            print(f"  IMR: {before_imr} → {after_imr} ({before_imr - after_imr} preenchidos)")
-            if n_refined > 0:
-                print(f"  Refinamento: {n_refined} valores refinados")
-
-        phases.append({'name': 'IMR+Refinamento', 'before': before_imr, 'after': final_missing})
-
-        end_time = time.time()
-        self.execution_stats = {
-            'initial_missing': initial_missing,
-            'final_missing': final_missing,
-            'execution_time': end_time - start_time,
-            'strategy': 'ISCA-k+PDS → IMR+Refinamento',
-            'phases': phases
-        }
-        if self.verbose:
-            self._print_summary()
 
         return result
 
@@ -301,8 +252,7 @@ class ISCAkCore:
         """
         Bootstrap simples respeitando tipos de variáveis.
 
-        USADO PARA: Dados mistos com < 5% linhas completas.
-        ALTERNATIVA AO IMR que não funciona para categóricas.
+        USADO PARA: Fallback final quando métodos baseados em distância não conseguem imputar.
 
         - Numéricas: Mediana
         - Binárias: Moda
@@ -353,7 +303,8 @@ class ISCAkCore:
         return result
 
     def _get_scaled_data(self, data: pd.DataFrame, force_refit: bool = False):
-        return get_scaled_data(data, self.mixed_handler, cache=self._scaled_cache, force_refit=force_refit)
+        return get_scaled_data(data, self.mixed_handler, cache=self._scaled_cache,
+                              force_refit=force_refit, scaling_method=self.scaling_method)
 
     def _compute_range_factors(self, data: pd.DataFrame, scaled_data: pd.DataFrame):
         return compute_range_factors(data, scaled_data, self.mixed_handler, verbose=False)
@@ -543,29 +494,61 @@ class ISCAkCore:
 
         # Dados dos doadores (escalonados para distâncias)
         donor_scaled = scaled_sub.loc[valid_donors.index, feature_cols].values.astype(np.float64)
+        donor_original = subdataset.loc[valid_donors.index, feature_cols].values.astype(np.float64)
         donor_targets = valid_donors[target_col].values
 
         # Modo clássico: usar apenas features onde o sample tem valores
-        # Os doadores do subdataset são linhas completas, então têm todas as features
         avail_indices = np.where(avail_mask)[0]
 
         # Escalonar o sample também
         sample_scaled = scaled_sub.loc[row_data.name, feature_cols].values.astype(np.float64) if row_data.name in scaled_sub.index else sample_features
-        sample_sub = sample_scaled[avail_indices]
-        donors_sub = donor_scaled[:, avail_indices]
+        sample_original = row_data[feature_cols].values.astype(np.float64)
+
+        sample_scaled_sub = sample_scaled[avail_indices]
+        sample_original_sub = sample_original[avail_indices]
+        donors_scaled_sub = donor_scaled[:, avail_indices]
+        donors_original_sub = donor_original[:, avail_indices]
 
         # Filtrar doadores com todas essas features (devem ser todos se subdataset é completo)
-        valid_donors_mask = ~np.isnan(donors_sub).any(axis=1)
+        valid_donors_mask = ~np.isnan(donors_scaled_sub).any(axis=1)
         if valid_donors_mask.sum() < self.min_friends:
             return None
 
-        donors_valid = donors_sub[valid_donors_mask]
+        donors_valid = donors_scaled_sub[valid_donors_mask]
+        donors_orig_valid = donors_original_sub[valid_donors_mask]
         targets_valid = donor_targets[valid_donors_mask]
 
         weights_sub = weights[avail_indices]
         weights_sub = weights_sub / weights_sub.sum() if weights_sub.sum() > 0 else np.ones_like(weights_sub) / len(weights_sub)
 
-        distances_valid = weighted_euclidean_batch(sample_sub, donors_valid, weights_sub)
+        # Máscaras de tipo para as features disponíveis
+        avail_feature_cols = [feature_cols[i] for i in avail_indices]
+        numeric_mask_sub = np.array([c in self.mixed_handler.numeric_cols for c in avail_feature_cols], dtype=np.bool_)
+        binary_mask_sub = np.array([c in self.mixed_handler.binary_cols for c in avail_feature_cols], dtype=np.bool_)
+        ordinal_mask_sub = np.array([c in self.mixed_handler.ordinal_cols for c in avail_feature_cols], dtype=np.bool_)
+        nominal_mask_sub = np.array([c in self.mixed_handler.nominal_cols for c in avail_feature_cols], dtype=np.bool_)
+        has_categorical = binary_mask_sub.any() or nominal_mask_sub.any() or ordinal_mask_sub.any()
+
+        if not has_categorical:
+            distances_valid = weighted_euclidean_batch(sample_scaled_sub, donors_valid, weights_sub)
+        else:
+            # Calcular range_factors para as features disponíveis
+            range_factors_sub = np.ones(len(avail_indices), dtype=np.float64)
+            for idx, col in enumerate(avail_feature_cols):
+                if col in self.mixed_handler.numeric_cols:
+                    col_values = scaled_sub[col].dropna()
+                    if len(col_values) > 1:
+                        empirical_range = col_values.max() - col_values.min()
+                        if empirical_range > 1e-6:
+                            range_factors_sub[idx] = 1.0 / empirical_range
+
+            distances_valid = range_normalized_mixed_distance(
+                sample_scaled_sub, donors_valid,
+                sample_original_sub, donors_orig_valid,
+                numeric_mask_sub, binary_mask_sub,
+                ordinal_mask_sub, nominal_mask_sub,
+                weights_sub, range_factors_sub
+            )
 
         # Selecionar k vizinhos
         k = adaptive_k_hybrid(
@@ -679,14 +662,14 @@ class ISCAkCore:
             imputed_value = None
 
             # === MODO PDS ===
-            # min_overlap = 50% das features para evitar escala PDS agressiva
+            # min_overlap calculado a partir do parâmetro min_pds_overlap (proporção)
             # Se não encontrar doadores, cai para modo clássico
-            min_pds_overlap = max(2, n_features // 2)
+            min_pds_overlap_count = max(2, int(n_features * self.min_pds_overlap))
 
-            if self._effective_pds and n_avail >= min_pds_overlap:
+            if self._effective_pds and n_avail >= min_pds_overlap_count:
                 if not has_categorical:
                     distances, n_shared = weighted_euclidean_pds(
-                        sample_scaled, X_ref_scaled, weights, min_pds_overlap
+                        sample_scaled, X_ref_scaled, weights, min_pds_overlap_count
                     )
                 else:
                     distances, n_shared = mixed_distance_pds(
@@ -694,7 +677,7 @@ class ISCAkCore:
                         sample_original, X_ref_original,
                         numeric_mask, binary_mask,
                         ordinal_mask, nominal_mask,
-                        weights, range_factors, min_pds_overlap
+                        weights, range_factors, min_pds_overlap_count
                     )
 
                 valid_mask = np.isfinite(distances)
