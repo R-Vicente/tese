@@ -4,21 +4,27 @@ import warnings
 
 
 @jit(nopython=True, parallel=True, cache=True)
-def weighted_euclidean_pds(sample, reference_matrix, weights, min_overlap=3):
+def weighted_euclidean_pds(sample, reference_matrix, weights):
     """
-    Distância euclidiana ponderada com Partial Distance Strategy.
+    Distância euclidiana ponderada com Partial Distance Strategy (Dixon 1979).
 
-    Permite donors com overlap parcial - calcula distância só nas features
-    onde AMBOS (sample e donor) têm valores.
+    Fórmula PDS clássica:
+        d(i,m) = sqrt( (p / |O_im|) * sum_{k in O_im} w_k * (x_ik - x_mk)^2 )
+
+    onde:
+        - p = número total de features
+        - |O_im| = número de features observadas em AMBAS as instâncias
+        - O scaling factor (p / |O_im|) extrapola a distância parcial para
+          estimar a distância completa, assumindo contribuição proporcional
+          das features não observadas.
 
     Args:
         sample: Array (n_features,) - pode ter NaN
         reference_matrix: Matriz (n_ref x n_features) - pode ter NaN
-        weights: Pesos por feature
-        min_overlap: Mínimo de features em comum
+        weights: Pesos por feature (MI weights)
 
     Returns:
-        distances: Array (n_ref,) - np.inf se overlap < min_overlap
+        distances: Array (n_ref,) - np.nan se overlap = 0
         n_shared: Array (n_ref,) - número de features partilhadas
     """
     n_ref = reference_matrix.shape[0]
@@ -28,31 +34,24 @@ def weighted_euclidean_pds(sample, reference_matrix, weights, min_overlap=3):
 
     for i in prange(n_ref):
         dist_sq = 0.0
-        weight_sum = 0.0
         count = 0
 
         for j in range(n_features):
-            # Só usa features onde AMBOS têm valores
+            # Só usa features onde AMBOS têm valores observados
             if not np.isnan(sample[j]) and not np.isnan(reference_matrix[i, j]):
                 diff = sample[j] - reference_matrix[i, j]
                 dist_sq += weights[j] * diff * diff
-                weight_sum += weights[j]
                 count += 1
 
         n_shared[i] = count
 
-        if count >= min_overlap and weight_sum > 0:
-            # Adaptive PDS scaling (threshold=0.5):
-            # - overlap < 50%: linear scaling (penalização forte)
-            # - overlap >= 50%: sqrt scaling (penalização suave)
-            overlap_ratio = count / n_features
-            if overlap_ratio < 0.5:
-                scale_factor = n_features / count  # linear
-            else:
-                scale_factor = np.sqrt(n_features / count)  # sqrt
+        if count > 0:
+            # PDS clássica: extrapola distância com scaling factor p/count
+            scale_factor = n_features / count
             distances[i] = np.sqrt(dist_sq * scale_factor)
         else:
-            distances[i] = np.inf
+            # Sem overlap - não é possível calcular distância
+            distances[i] = np.nan
 
     return distances, n_shared
 
@@ -62,11 +61,31 @@ def mixed_distance_pds(sample, reference_matrix,
                        sample_original, reference_original,
                        numeric_mask, binary_mask,
                        ordinal_mask, nominal_mask,
-                       weights, range_factors, min_overlap=3):
+                       weights, range_factors):
     """
-    Distância mista com Partial Distance Strategy.
+    Distância mista com Partial Distance Strategy (Dixon 1979).
 
-    Permite donors com overlap parcial.
+    Fórmula PDS clássica adaptada para dados mistos:
+        d(i,m) = (p / |O_im|) * (sum_{k in O_im} contrib_k) / (sum_{k in O_im} w_k)
+
+    onde contrib_k depende do tipo de variável:
+        - Numérica: |x_ik - x_mk| * range_factor * w_k
+        - Ordinal: |x_ik - x_mk| * w_k
+        - Binária: 0 se igual, w_k se diferente
+        - Nominal: 0 se igual, w_k se diferente
+
+    Args:
+        sample: Array (n_features,) - valores scaled, pode ter NaN
+        reference_matrix: Matriz (n_ref x n_features) - valores scaled
+        sample_original: Array (n_features,) - valores originais para nominais
+        reference_original: Matriz (n_ref x n_features) - valores originais
+        numeric_mask, binary_mask, ordinal_mask, nominal_mask: Máscaras de tipo
+        weights: Pesos por feature (MI weights)
+        range_factors: Factores de normalização por range
+
+    Returns:
+        distances: Array (n_ref,) - np.nan se overlap = 0
+        n_shared: Array (n_ref,) - número de features partilhadas
     """
     n_ref = reference_matrix.shape[0]
     n_features = len(sample)
@@ -79,7 +98,7 @@ def mixed_distance_pds(sample, reference_matrix,
         count = 0
 
         for j in range(n_features):
-            # Só usa features onde AMBOS têm valores
+            # Só usa features onde AMBOS têm valores observados
             s_val = sample[j]
             r_val = reference_matrix[i, j]
 
@@ -110,18 +129,13 @@ def mixed_distance_pds(sample, reference_matrix,
 
         n_shared[i] = count
 
-        if count >= min_overlap and total_weight > 0:
-            # Adaptive PDS scaling (threshold=0.5):
-            # - overlap < 50%: linear scaling (penalização forte)
-            # - overlap >= 50%: sqrt scaling (penalização suave)
-            overlap_ratio = count / n_features
-            if overlap_ratio < 0.5:
-                scale_factor = n_features / count  # linear
-            else:
-                scale_factor = np.sqrt(n_features / count)  # sqrt
+        if count > 0 and total_weight > 0:
+            # PDS clássica: extrapola distância com scaling factor p/count
+            scale_factor = n_features / count
             distances[i] = (weighted_dist / total_weight) * scale_factor
         else:
-            distances[i] = np.inf
+            # Sem overlap - não é possível calcular distância
+            distances[i] = np.nan
 
     return distances, n_shared
 

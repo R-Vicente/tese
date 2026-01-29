@@ -29,8 +29,7 @@ class ISCAkCore:
                  adaptive_k_alpha: float = 0.5, fast_mode: bool = False,
                  use_fcm: bool = False, n_clusters: int = 8,
                  n_top_clusters: int = 3, fcm_membership_threshold: float = 0.05,
-                 use_pds: bool = True, min_overlap: int = None,
-                 min_pds_overlap: float = 0.5, scaling_method: str = "standard"):
+                 use_pds: bool = True, scaling_method: str = "standard"):
         """
         Args:
             min_friends: Número mínimo de vizinhos (k_min)
@@ -46,9 +45,9 @@ class ISCAkCore:
             n_clusters: Número de clusters para FCM
             n_top_clusters: Número de clusters a considerar na busca
             fcm_membership_threshold: Threshold mínimo de membership
-            use_pds: Se True, usa Partial Distance Strategy (permite donors com overlap parcial)
-            min_overlap: Mínimo de features em comum (default: max(3, n_features//3))
-            min_pds_overlap: Proporção mínima de overlap para activar PDS (0.0 a 1.0, default 0.5)
+            use_pds: Se True, usa Partial Distance Strategy (Dixon 1979) para calcular
+                     distâncias com overlap parcial. A PDS extrapola a distância usando
+                     o scaling factor p/|O| onde p=total features e |O|=features observadas.
             scaling_method: Método de scaling para numéricas:
                 - "standard": z-score (default)
                 - "minmax": [0, 1]
@@ -68,9 +67,6 @@ class ISCAkCore:
         self.n_top_clusters = n_top_clusters
         self.fcm_membership_threshold = fcm_membership_threshold
         self.use_pds = use_pds
-        self._min_overlap_user = min_overlap  # Guardado para calcular depois
-        self.min_overlap = min_overlap  # Será ajustado no impute()
-        self.min_pds_overlap = min_pds_overlap
         self.scaling_method = scaling_method
         self.scaler = None
         self.mi_matrix = None
@@ -458,8 +454,8 @@ class ISCAkCore:
         """
         Imputa um único valor usando o subdataset como doadores.
 
-        NOTA: Usa sempre modo clássico (sem PDS) porque na Fase 2 as linhas
-        residuais têm muitos missings e min_overlap do PDS seria muito restritivo.
+        NOTA: Usa modo clássico (sem PDS) na Fase 2 porque opera sobre um
+        subdataset filtrado onde as features já são conhecidas.
 
         Args:
             row_data: Series com os dados da linha a imputar
@@ -661,15 +657,15 @@ class ISCAkCore:
 
             imputed_value = None
 
-            # === MODO PDS ===
-            # min_overlap calculado a partir do parâmetro min_pds_overlap (proporção)
-            # Se não encontrar doadores, cai para modo clássico
-            min_pds_overlap_count = max(2, int(n_features * self.min_pds_overlap))
+            # === MODO PDS (Dixon 1979) ===
+            # PDS calcula distâncias usando apenas features observadas em comum,
+            # extrapolando com factor p/|O| para estimar distância completa.
+            # Não há threshold de rejeição - qualquer overlap >= 1 é válido.
 
-            if self._effective_pds and n_avail >= min_pds_overlap_count:
+            if self._effective_pds and n_avail >= 1:
                 if not has_categorical:
                     distances, n_shared = weighted_euclidean_pds(
-                        sample_scaled, X_ref_scaled, weights, min_pds_overlap_count
+                        sample_scaled, X_ref_scaled, weights
                     )
                 else:
                     distances, n_shared = mixed_distance_pds(
@@ -677,10 +673,11 @@ class ISCAkCore:
                         sample_original, X_ref_original,
                         numeric_mask, binary_mask,
                         ordinal_mask, nominal_mask,
-                        weights, range_factors, min_pds_overlap_count
+                        weights, range_factors
                     )
 
-                valid_mask = np.isfinite(distances)
+                # PDS retorna np.nan quando overlap=0, filtrar esses casos
+                valid_mask = ~np.isnan(distances)
                 if valid_mask.sum() >= self.min_friends:
                     distances_valid = distances[valid_mask]
                     y_ref_valid = y_ref[valid_mask]
@@ -689,7 +686,7 @@ class ISCAkCore:
                     )
                 # Se não encontrar doadores suficientes, cai para modo clássico abaixo
 
-            # === MODO CLÁSSICO (sem PDS ou overlap=1) ===
+            # === MODO CLÁSSICO (fallback quando PDS desactivado ou sem doadores) ===
             if imputed_value is None and n_avail >= 1:
                 avail_indices = np.where(avail_mask)[0]
                 sample_scaled_sub = sample_scaled[avail_indices]
