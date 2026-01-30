@@ -3,3 +3,4 @@
 
 from .type_detection import detect_variable_types, VariableType, VariableInfo
 from .data_analysis import DatasetAnalyzer, MissingPattern
+from .mixed_data_handler import MixedDataHandler
